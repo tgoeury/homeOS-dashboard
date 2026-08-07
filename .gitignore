@@ -1,0 +1,25 @@
+# ── Configuration locale — NE JAMAIS COMMITER ────────────────────────────────
+# config.py contient des secrets (token Plex, token Enedis, webhook Synology)
+# et des données personnelles (coordonnées GPS du logement, PDL, IP du LAN).
+# Le modèle publiable est config.example.py.
+config.py
+
+# ── Données et modèles (montés en volume au runtime) ─────────────────────────
+data/
+models/
+*.db
+*.db-shm
+*.db-wal
+
+# ── Artefacts Python ─────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# ── IDE / OS ─────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
