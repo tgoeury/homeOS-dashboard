@@ -1,0 +1,4 @@
+# Dépendances de développement (tests, lint)
+-r requirements.txt
+pytest>=7.4
+pytest-mock>=3.12
