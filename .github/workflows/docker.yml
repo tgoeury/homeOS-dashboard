@@ -1,0 +1,218 @@
+name: Docker
+
+# Construit l'image du dashboard principal et la publie sur GitHub Container Registry.
+#
+#   push sur la branche par défaut  → publie :latest et :<sha>
+#   tag v*                          → publie :1.2.3, :1.2, :1 et :latest
+#   pull request                    → construit et teste SANS publier
+#   déclenchement manuel            → idem push
+#
+# Aucun secret à configurer : GITHUB_TOKEN suffit pour ghcr.io. Le paquet est
+# créé en privé au premier push ; le rendre public se fait une fois pour toutes
+# dans Settings → Packages du dépôt.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+# Une PR qui reçoit plusieurs commits d'affilée n'a pas besoin de builds
+# multi-arch concurrents : seul le dernier compte.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  # La cible de déploiement est un Raspberry Pi 3 sous OS 64 bits → linux/arm64
+  # (cf. README, « un RPi 3 nécessite un OS 64 bits »). amd64 sert au poste de
+  # développement et au test de démarrage ci-dessous. Pour un RPi en 32 bits
+  # (Raspberry Pi OS armhf), ajouter linux/arm/v7 — au prix d'un build QEMU
+  # supplémentaire, nettement plus lent, et de roues onnxruntime à vérifier.
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  # ── Garde-fou : on ne publie pas une image dont les tests échouent ──────────
+  tests:
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Installer les dépendances
+        run: pip install -r requirements-dev.txt
+
+      # config.py n'est pas versionné (secrets Plex/Enedis/Synology et données
+      # personnelles) : les tests ont besoin d'un config importable, le modèle
+      # fait l'affaire.
+      - name: Préparer config.py depuis le modèle
+        run: cp config.example.py config.py
+
+      - name: pytest
+        run: pytest
+
+  # ── Construction, test de l'image, publication ─────────────────────────────
+  docker:
+    name: build & push
+    needs: tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU : nécessaire pour produire la variante arm64 depuis un runner x86.
+      - name: Configurer QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Configurer Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Pas sur les PR : le token d'une PR issue d'un fork est en lecture seule.
+      - name: Se connecter à ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Calculer les tags et labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=HomeOS main_dashboard
+            org.opencontainers.image.description=Dashboard domotique principal (capteurs, météo, énergie, réseau, musique) pour installation auto-hébergée
+
+      # Build amd64 seul, chargé dans le démon local, pour pouvoir le LANCER.
+      # Le cache GHA est partagé avec le build multi-arch qui suit : cette étape
+      # ne fait donc pas payer deux fois la construction amd64.
+      - name: Construire l'image amd64 (pour test)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: homeos-main-dashboard:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Une image qui se construit mais ne démarre pas n'a aucune valeur : on
+      # vérifie que gunicorn répond réellement.
+      - name: Test de démarrage
+        run: |
+          # Le volume data doit être inscriptible par l'utilisateur du conteneur
+          # (appuser, uid 1000) alors que le runner tourne en uid 1001 — et
+          # SQLite a besoin d'écrire cache.db-wal/-shm même pour lire.
+          mkdir -p ci-data && chmod 777 ci-data
+
+          # Le modèle de config sert de config.py : ses credentials sont vides
+          # ou factices, donc Plex, le chatbot et Enedis restent inertes.
+          docker run -d --name smoke -p 8050:8050 \
+            -v "$PWD/config.example.py:/app/config.py:ro" \
+            -v "$PWD/ci-data:/app/data" \
+            homeos-main-dashboard:ci
+
+          for i in $(seq 1 30); do
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8050/)" = "200" ]; then
+              echo "✓ HTTP 200 après ${i}s"; ok=1; break
+            fi
+            sleep 1
+          done
+
+          docker logs smoke
+
+          if [ -z "$ok" ]; then
+            echo "::error::le conteneur ne répond pas sur le port 8050"
+            exit 1
+          fi
+
+          # Le titre de la page contient la version et le nom du logement :
+          # sa présence prouve que config.py a bien été lu et le layout construit.
+          curl -s http://127.0.0.1:8050/ | grep -q 'HomeOS v' \
+            || { echo "::error::page servie inattendue"; exit 1; }
+          echo "✓ layout rendu"
+
+          # Le layout complet (les 10 pages) est servi par /_dash-layout, Dash
+          # rendant la page côté client. On y vérifie les éléments dont l'absence
+          # ne se verrait pas sur la page nue : navigation inter-dashboards et
+          # badge d'état de la base, seul indicateur de collecte de la topbar.
+          curl -s http://127.0.0.1:8050/_dash-layout > layout.json
+          for id in btn-open-broker btn-open-extended badge-database sys-services; do
+            grep -q "$id" layout.json \
+              || { echo "::error::élément $id absent du layout"; exit 1; }
+          done
+          echo "✓ navigation et badges présents"
+
+          # gunicorn sert l'application : l'avertissement « development server »
+          # de werkzeug ne doit jamais apparaître dans une image publiée.
+          if docker logs smoke 2>&1 | grep -qi 'development server'; then
+            echo "::error::l'image démarre le serveur de développement werkzeug"
+            exit 1
+          fi
+          echo "✓ servi par gunicorn"
+
+          docker rm -f smoke
+
+      # Vérifie qu'aucune donnée personnelle n'a fuité dans l'image publiée :
+      # .dockerignore doit exclure config.py et le contenu de data/.
+      - name: Vérifier l'absence de données personnelles
+        run: |
+          docker run --rm --entrypoint sh homeos-main-dashboard:ci \
+            -c 'test ! -f /app/config.py && test -z "$(ls -A /app/data 2>/dev/null)"' \
+            || { echo "::error::config.py ou des données sont embarqués dans l image"; exit 1; }
+          echo "✓ ni config.py ni données embarquées"
+
+      - name: Construire et publier (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          # Sur une PR on construit les deux architectures pour valider le
+          # build arm64 (celui du RPi), mais on ne publie rien.
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Récapitulatif
+        if: github.event_name != 'pull_request'
+        run: |
+          {
+            echo "### Image publiée"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "Plateformes : \`${{ env.PLATFORMS }}\`"
+            echo
+            echo "Déploiement sur le Raspberry Pi (OS 64 bits) :"
+            echo
+            echo '```bash'
+            echo "docker pull ${{ env.IMAGE }}:latest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
