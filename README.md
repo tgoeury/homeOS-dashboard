@@ -251,6 +251,21 @@ docker run -d --name homeos-main-dashboard \
 `cache.db` entre les trois conteneurs. L'image est multi-arch (amd64 et arm64) ;
 un RPi 3 nécessite un OS 64 bits.
 
+### Image publiée
+
+Le workflow [`.github/workflows/docker.yml`](.github/workflows/docker.yml)
+construit et publie l'image sur GitHub Container Registry à chaque push sur la
+branche par défaut (`:latest` et `:<sha>`) et à chaque tag `v*` (`:1.2.3`,
+`:1.2`, `:1`). Sur le Raspberry Pi, plus besoin de compiler localement :
+
+```bash
+docker pull ghcr.io/<utilisateur>/<dépôt>:latest
+```
+
+Les pull requests déclenchent le build des deux architectures et le test de
+démarrage, mais ne publient rien. Aucun secret n'est à configurer — le
+`GITHUB_TOKEN` du dépôt suffit pour `ghcr.io`.
+
 ## Architecture du code
 
 ```
@@ -277,7 +292,7 @@ modules/
   logic_engine.py           Aiguillage du traitement des messages (stub FORWARD)
 
 assets/cyberpunk.css        Feuille de style (chargée automatiquement par Dash)
-tests/                      137 tests unitaires
+tests/                      140 tests unitaires
 ```
 
 ### Principes de conception
@@ -364,27 +379,28 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-137 tests couvrent le moteur de confort, l'état de la base, les minuteurs, le
+140 tests couvrent le moteur de confort, l'état de la base, les minuteurs, le
 thème et les moteurs de chat. Ils s'exécutent en environ une seconde et
 n'utilisent ni réseau ni base de production (`tmp_path` de pytest).
+
+Ils tournent aussi en intégration continue : le workflow
+[`.github/workflows/docker.yml`](.github/workflows/docker.yml) refuse de publier
+une image dont les tests échouent.
 
 ## Limites connues
 
 À savoir avant de se fier à l'affichage :
 
-- **Le compteur « Messages MQTT » et les scores d'anomalie « Isolation Forest »
-  de la page Système sont simulés** — respectivement un compteur incrémenté au
-  hasard et des valeurs aléatoires. Ce sont des maquettes d'interface, pas des
-  mesures. La carte « Points InfluxDB » est figée à 0 pour la même raison.
-- Le statut `influxdb` reflète seulement l'accessibilité de la base SQLite :
-  aucune série InfluxDB n'existe dans ce schéma.
+- **Les scores d'anomalie « Isolation Forest » de la page Système sont simulés**
+  — des valeurs aléatoires. C'est une maquette d'interface, pas une mesure.
 - Le moteur de confort suppose volets et fenêtres **fermés** en état initial :
   les actionneurs ne sont pas encore intégrés, il propose un plan sans savoir
   lire l'état réel.
-- `ENEDIS` reste en `OUTDATED` (orange) la majeure partie de la journée : la
-  règle générale est « frais si moins d'une heure », alors qu'Enedis ne publie
-  qu'une fois par jour. C'est voulu — « connecté mais pas récent » plutôt qu'une
-  alerte.
+- Les sources collectées par `data_broker` (MQTT, météo, DNS, Enedis…) ne sont
+  plus supervisées une par une : la topbar n'affiche que l'accès à la base
+  (`DATABASE`) et la page Système la fraîcheur de sa donnée la plus récente. Une
+  source qui décroche seule n'est donc visible que par ses données figées, ou
+  dans le mini-dashboard de `data_broker`.
 - Un seul worker gunicorn est supporté (état en mémoire).
 
 ## Licence
