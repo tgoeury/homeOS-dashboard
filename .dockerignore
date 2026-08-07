@@ -1,0 +1,27 @@
+# Données locales — montées en volume au runtime
+data/
+models/
+
+# Config sensible — montée en volume au runtime
+config.py
+
+# Artefacts Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Git
+.git/
+.gitignore
+
+# Dev uniquement
+tests/
+docs/
+requirements-dev.txt
+conftest.py
+pytest.ini
+
+# IDE
+.vscode/
+.idea/
