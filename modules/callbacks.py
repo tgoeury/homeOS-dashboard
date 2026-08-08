@@ -45,7 +45,7 @@ import config as CFG
 from modules.dashboard_layout import PAGE_IDS, ROOMS, CONFORT_ROOMS
 from modules import timer_service
 from modules.data_cache       import data_cache
-from modules import chatbot_engine, logic_engine
+from modules import anomaly_engine, chatbot_engine, logic_engine
 from modules.logic_engine     import LogicMode
 from modules import db_status
 from modules import comfort_engine
@@ -1467,7 +1467,7 @@ _ML_STATIC_HEADER = [
     html.Div([
         html.Span("MODÈLE", style={"fontSize": "12px", "color": CP["text_dim"],
                                     "fontFamily": FONT_MONO, "letterSpacing": "2px"}),
-        html.Span("sklearn.IsolationForest", style={"fontSize": "14px", "color": CP["cyan"],
+        html.Span(anomaly_engine.MODEL_NAME, style={"fontSize": "14px", "color": CP["cyan"],
                                                      "fontFamily": FONT_MONO}),
     ], style={"display": "flex", "justifyContent": "space-between",
               "borderBottom": "1px solid rgba(0,229,255,0.08)", "paddingBottom": "8px",
@@ -1491,22 +1491,40 @@ _ML_STATIC_HEADER = [
                 style={"fontSize": "13px", "color": CP["text_dim"], "fontFamily": FONT_MONO}),
     ], style={"paddingLeft": "18px", "marginBottom": "12px"}),
 
-    html.Div("Scores d'anomalie en temps réel :", style={
+    html.Div(f"Scores d'anomalie — fenêtre glissante "
+             f"{anomaly_engine.TRAIN_WINDOW_S // 86400} jours :", style={
         "fontSize": "13px", "color": CP["text_dim"], "fontFamily": FONT_MONO,
         "marginBottom": "8px",
     }),
 ]
 
-_ML_STATIC_FOOTER = html.Div([
-    html.Span("STATUT GLOBAL", style={"fontSize": "12px", "color": CP["text_dim"],
-                                       "fontFamily": FONT_MONO, "letterSpacing": "2px"}),
-    html.Span("AUCUNE ANOMALIE DÉTECTÉE", style={
-        "fontSize": "13px", "color": CP["green"], "fontFamily": FONT_MONO,
-        "letterSpacing": "1px",
-    }),
-], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center",
-          "marginTop": "10px", "paddingTop": "8px",
-          "borderTop": "1px solid rgba(0,229,255,0.08)"})
+def _ml_footer(scores: list) -> html.Div:
+    """Ligne « STATUT GLOBAL » — résumé des scores affichés au-dessus."""
+    n_alert = sum(1 for s in scores if s.status in ("ANOMALIE", "SILENCIEUX"))
+    n_warn  = sum(1 for s in scores if s.status == "ATTENTION")
+    n_judged = sum(1 for s in scores if s.status != "APPRENTISSAGE")
+    if n_alert:
+        label, color = f"{n_alert} ANOMALIE{'S' if n_alert > 1 else ''}", CP["red"]
+    elif n_warn:
+        label, color = f"{n_warn} CAPTEUR{'S' if n_warn > 1 else ''} À SURVEILLER", CP["yellow"]
+    elif n_judged:
+        # « Aucune » ne vaut que pour les capteurs réellement jugés — l'annoncer
+        # alors que tous sont encore en apprentissage serait un faux acquit.
+        label, color = f"AUCUNE ANOMALIE · {n_judged} CAPTEURS SUIVIS", CP["green"]
+    elif scores:
+        label, color = "APPRENTISSAGE EN COURS", CP["text_dim"]
+    else:
+        label, color = "EN ATTENTE DE DONNÉES", CP["text_dim"]
+    return html.Div([
+        html.Span("STATUT GLOBAL", style={"fontSize": "12px", "color": CP["text_dim"],
+                                           "fontFamily": FONT_MONO, "letterSpacing": "2px"}),
+        html.Span(label, style={
+            "fontSize": "13px", "color": color, "fontFamily": FONT_MONO,
+            "letterSpacing": "1px",
+        }),
+    ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center",
+              "marginTop": "10px", "paddingTop": "8px",
+              "borderTop": "1px solid rgba(0,229,255,0.08)"})
 
 
 @callback(
@@ -1621,8 +1639,9 @@ def update_system(_n):
         for svc, kind, state in services_data
     ])
 
-    # Boîte ML — Isolation Forest (titre/description/liste constants, cf. _ML_STATIC_*)
-    ml_content = html.Div([*_ML_STATIC_HEADER, *_build_anomaly_rows(), _ML_STATIC_FOOTER])
+    # Boîte ML — Isolation Forest (titre/description/liste constants, cf. _ML_STATIC_HEADER)
+    ml_rows, ml_scores = _build_anomaly_rows()
+    ml_content = html.Div([*_ML_STATIC_HEADER, *ml_rows, _ml_footer(ml_scores)])
 
     return (
         _bar(cpu,       CP["cyan"]),   f"{cpu}%",
@@ -1636,53 +1655,77 @@ def update_system(_n):
     )
 
 
-def _build_anomaly_rows() -> list:
-    """
-    Construit dynamiquement les lignes ML pour les capteurs actifs.
-    Un capteur est "actif" si data/cache.db a une valeur fraîche (< 900 s) pour
-    temperature ou humidity.
-    """
-    rows = []
-    for r_id, r_name, _, r_sensors in ROOMS:
-        for s_id, s_label, *_ in r_sensors:
-            field = _field_from_sid(s_id)
-            if field not in ("temperature", "humidity"):
-                continue
-            scope = _sensor_scope(r_id, s_id)
-            if _fresh_value(f"sensor.{scope}.{field}", _ROOM_FRESH_MAX_AGE) is None:
-                continue
-            rows.append(_anomaly_row(f"{r_name} · {s_label}", round(random.uniform(0.0, 0.15), 2)))
-    if not rows:
-        rows.append(html.Div(
-            "// Aucun capteur actif — en attente de données Zigbee //",
-            style={"color": CP["text_dim"], "fontFamily": FONT_MONO,
-                   "fontSize": "13px", "letterSpacing": "1px", "padding": "8px 0"},
-        ))
-    return rows
+# Capteurs soumis à la détection d'anomalies : (scope, field) → libellé affiché.
+# Construit une fois à l'import depuis ROOMS, comme les autres mappings du module
+# — la topologie du logement ne change pas en cours d'exécution.
+_ANOMALY_SENSORS: dict[tuple[str, str], str] = {}
+for _ar_id, _ar_name, _, _ar_sensors in ROOMS:
+    for _as_id, _as_label, *_ in _ar_sensors:
+        _af = _field_from_sid(_as_id)
+        if _af in ("temperature", "humidity"):
+            _ANOMALY_SENSORS[(_sensor_scope(_ar_id, _as_id), _af)] = f"{_ar_name} · {_as_label}"
 
 
-def _anomaly_row(label: str, score: float) -> html.Div:
+def _build_anomaly_rows() -> tuple[list, list]:
     """
-    Ligne de score d'anomalie Isolation Forest (page Système).
-    score > 0.5 → ANOMALIE (rouge) / > 0.3 → ATTENTION (jaune) / sinon NORMAL (vert).
+    Lignes de scores d'anomalie de la page Système, et les SensorScore
+    correspondants (pour le résumé de _ml_footer).
+
+    Les scores viennent d'anomaly_engine, qui les calcule sur l'historique réel
+    de data/cache.db. get_scores() ne bloque pas : tant que la première forêt
+    n'est pas entraînée, elle retourne None et on affiche l'attente plutôt que
+    de faire patienter le callback.
     """
-    color  = CP["red"] if score > 0.5 else CP["yellow"] if score > 0.3 else CP["green"]
-    pct    = round(score * 100)
-    status = "ANOMALIE" if score > 0.5 else "ATTENTION" if score > 0.3 else "NORMAL"
+    scores = anomaly_engine.get_scores(list(_ANOMALY_SENSORS))
+    if scores is None:
+        return [_ml_placeholder("// entraînement du modèle en cours //")], []
+
+    shown = [(label, scores[key]) for key, label in _ANOMALY_SENSORS.items() if key in scores]
+    if not shown:
+        return [_ml_placeholder("// Aucun capteur actif — en attente de données Zigbee //")], []
+    return [_anomaly_row(label, s) for label, s in shown], [s for _, s in shown]
+
+
+def _ml_placeholder(text: str) -> html.Div:
+    return html.Div(text, style={
+        "color": CP["text_dim"], "fontFamily": FONT_MONO,
+        "fontSize": "13px", "letterSpacing": "1px", "padding": "8px 0",
+    })
+
+
+# Statut → couleur de la ligne. SILENCIEUX partage le rouge d'ANOMALIE (c'en est
+# une, détectée par règle plutôt que par la forêt) ; APPRENTISSAGE reste neutre :
+# le capteur n'a pas encore assez d'historique pour être jugé.
+_ANOMALY_COLORS = {
+    "ANOMALIE":      "red",
+    "SILENCIEUX":    "red",
+    "ATTENTION":     "yellow",
+    "NORMAL":        "green",
+    "APPRENTISSAGE": "text_dim",
+}
+
+
+def _anomaly_row(label: str, score) -> html.Div:
+    """Ligne de score d'anomalie (page Système) pour un anomaly_engine.SensorScore.
+    Le `detail` du score est exposé en infobulle : il dit pourquoi la ligne est
+    dans cet état, sans encombrer une boîte déjà dense."""
+    color = CP[_ANOMALY_COLORS.get(score.status, "text_dim")]
+    pct   = round(score.score * 100)
     return html.Div([
         html.Span(label, style={"fontSize": "13px", "color": CP["text_dim"],
                                  "fontFamily": FONT_MONO, "minWidth": "130px"}),
         html.Div(html.Div(style={"height": "100%", "width": f"{pct}%", "background": color}),
                  style={"flex": "1", "height": "5px", "background": "rgba(255,255,255,0.05)"}),
-        html.Span(f"{score:.2f}", style={
+        html.Span(f"{score.score:.2f}", style={
             "fontSize": "12px", "fontFamily": FONT_MONO,
             "color": color, "minWidth": "36px", "textAlign": "right",
         }),
-        html.Span(status, style={
+        html.Span(score.status, style={
             "fontSize": "11px", "fontFamily": FONT_MONO, "color": color,
-            "minWidth": "72px", "textAlign": "right", "letterSpacing": "1px",
+            "minWidth": "88px", "textAlign": "right", "letterSpacing": "1px",
         }),
-    ], style={"display": "flex", "alignItems": "center", "gap": "10px", "marginBottom": "7px"})
+    ], title=score.detail,
+       style={"display": "flex", "alignItems": "center", "gap": "10px", "marginBottom": "7px"})
 
 
 # ── Réseau ────────────────────────────────────────────────────────────────────

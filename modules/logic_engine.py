@@ -6,8 +6,12 @@ Stub initial : forwarde les messages tels quels (mode FORWARD).
 
 Roadmap d'évolution :
   FORWARD → relay direct, aucun traitement — implémenté ✓
-  ML      → Isolation Forest / modèle local sur données capteurs (TODO)
+  ML      → modèle local sur données capteurs (TODO)
   CLAUDE  → API Anthropic Claude (claude-sonnet-4-6 ou opus-4-7) (TODO)
+
+À ne pas confondre avec modules/anomaly_engine.py, qui détecte bel et bien des
+anomalies capteurs par Isolation Forest : il alimente la page Système, pas le
+chatbot. Le mode ML ci-dessous concerne le traitement des MESSAGES.
 
 Pour migrer vers un daemon autonome :
   1. Extraire ce module dans un processus séparé
