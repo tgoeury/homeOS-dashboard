@@ -16,17 +16,29 @@ agent conversationnel · planification volets/fenêtres par modèle prédictif.
 
 ## Sommaire
 
-- [À quoi sert ce dépôt](#à-quoi-sert-ce-dépôt)
-- [Place dans l'écosystème HomeOS](#place-dans-lécosystème-homeos)
-- [Les dix onglets](#les-dix-onglets)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Utilisation](#utilisation)
-- [Déploiement Docker](#déploiement-docker)
-- [Architecture du code](#architecture-du-code)
-- [Performance sur petit matériel](#performance-sur-petit-matériel)
-- [Tests](#tests)
-- [Limites connues](#limites-connues)
+- [HomeOS — main\_dashboard](#homeos--main_dashboard)
+  - [Sommaire](#sommaire)
+  - [À quoi sert ce dépôt](#à-quoi-sert-ce-dépôt)
+  - [Place dans l'écosystème HomeOS](#place-dans-lécosystème-homeos)
+  - [Les dix onglets](#les-dix-onglets)
+  - [Installation](#installation)
+  - [Configuration](#configuration)
+    - [Clés principales](#clés-principales)
+    - [Déclarer une pièce et ses capteurs](#déclarer-une-pièce-et-ses-capteurs)
+  - [Utilisation](#utilisation)
+    - [En production](#en-production)
+  - [Déploiement Docker](#déploiement-docker)
+    - [Image publiée](#image-publiée)
+  - [Architecture du code](#architecture-du-code)
+    - [Principes de conception](#principes-de-conception)
+  - [Détection d'anomalies](#détection-danomalies)
+    - [Ce qui est donné au modèle](#ce-qui-est-donné-au-modèle)
+    - [Deux choix qui méritent une explication](#deux-choix-qui-méritent-une-explication)
+    - [Ce qu'affiche le panneau](#ce-quaffiche-le-panneau)
+  - [Performance sur petit matériel](#performance-sur-petit-matériel)
+  - [Tests](#tests)
+  - [Limites connues](#limites-connues)
+  - [Licence](#licence)
 
 ---
 
@@ -34,7 +46,7 @@ agent conversationnel · planification volets/fenêtres par modèle prédictif.
 
 `main_dashboard` est **l'interface** de HomeOS. Il ne collecte presque rien
 lui-même : il lit une base SQLite (`data/cache.db`) alimentée par un processus
-séparé, [`data_broker`](../data_broker), et se contente de la mettre en forme.
+séparé, `data_broker`, et se contente de la mettre en forme.
 
 Cette séparation est le choix structurant du projet. Elle permet :
 
@@ -94,7 +106,7 @@ ailleurs.
 | **Confort** | Plage de température souhaitée par pièce, puis inférence ONNX proposant un plan volets/fenêtres sur 24 h | modèle ONNX local |
 | **Énergie** | Consommation Enedis : hier, mois en cours, mois précédent, barplot 30 jours et 13 mois, bascule kWh/€ | `cache.db` |
 | **Réseau** | Appareils du LAN, statistiques NextDNS, volumes et santé du NAS, carte mondiale du trafic DNS | `cache.db` |
-| **Système** | CPU, RAM, disque, température, uptime, état des services | psutil + `cache.db` |
+| **Système** | CPU, RAM, disque, température, uptime, état des services, scores d'anomalie par capteur | psutil + `cache.db` |
 | **Chatbot** | Conversation avec un agent LangGraph via API REST, plus réception des messages Synology Chat | API externe |
 
 Les onglets dont le service n'est pas configuré (`PLEX_TOKEN`, `ENEDIS_TOKEN`,
@@ -288,11 +300,13 @@ modules/
   ytdlp_service.py          Téléchargement audio en arrière-plan + tags ID3
   timer_service.py          Minuteurs en mémoire, presets persistés
   comfort_engine.py         Inférence ONNX + planification volets/fenêtres
+  anomaly_engine.py         Isolation Forest (numpy) sur les séries capteurs
   chatbot_engine.py         File de messages Synology Chat
   logic_engine.py           Aiguillage du traitement des messages (stub FORWARD)
+  lazy.py                   Proxy d'import paresseux (numpy, pandas, onnxruntime)
 
 assets/cyberpunk.css        Feuille de style (chargée automatiquement par Dash)
-tests/                      140 tests unitaires
+tests/                      175 tests unitaires
 ```
 
 ### Principes de conception
@@ -313,6 +327,86 @@ un travail entièrement jeté ensuite (~15 à 57 ms par figure sur RPi).
 **La base est la seule source de vérité.** Aucun état partagé entre callbacks
 hormis les `dcc.Store` côté navigateur, ce qui rend chaque callback testable
 isolément.
+
+## Détection d'anomalies
+
+La boîte **Alertes ML** de la page Système note chaque capteur de température et
+d'hygrométrie sur son propre historique, par un **Isolation Forest** (Liu, Ting &
+Zhou, ICDM 2008) implémenté en numpy dans
+[`modules/anomaly_engine.py`](modules/anomaly_engine.py).
+
+L'algorithme part d'une observation simple : une anomalie est *rare et
+différente*, donc plus facile à isoler du reste. On construit des arbres en
+coupant au hasard une variable à un seuil au hasard ; un point qui se retrouve
+seul après peu de coupes est anormal. Le score est fonction de la profondeur
+moyenne à laquelle le point s'isole, sur l'ensemble des arbres.
+
+### Ce qui est donné au modèle
+
+Chaque série `sensor_<pièce>_<mesure>` est rééchantillonnée sur une grille de
+15 min couvrant 7 jours, puis décrite par cinq variables **sans dimension**, donc
+comparables d'un capteur à l'autre :
+
+| Variable | Ce qu'elle capte |
+|---|---|
+| `z` | écart à la médiane de la série, en IQR — valeur hors de la plage habituelle |
+| `d1` | variation sur 15 min, en IQR — pic ou chute rapide |
+| `d3h` | écart à la moyenne mobile 3 h, en IQR — dérive lente |
+| `gap` | ancienneté du relevé rapportée à l'intervalle habituel — capteur intermittent |
+| `xroom` | écart au mouvement commun des autres pièces — corrélation rompue |
+
+Une **forêt par mesure** est entraînée sur les lignes de tous les capteurs mis en
+commun : plus de données d'entraînement, et un capteur isolé profite du
+comportement des autres. C'est la normalisation par capteur (médiane et IQR
+propres à chaque série) qui rend cette mise en commun légitime — une pièce
+structurellement plus froide qu'une autre ne ressort pas comme anomalie.
+
+### Deux choix qui méritent une explication
+
+**Le silence est détecté par une règle, pas par la forêt.** Un capteur muet est
+marqué `SILENCIEUX` avant même d'atteindre le modèle. C'est délibéré : un capteur
+tombé depuis trois jours remplit la moitié de la fenêtre d'entraînement de points
+« silencieux », qui cessent donc d'être rares — une forêt d'isolation les jugerait
+normaux. La forêt garde les silences courts et intermittents, via la variable
+`gap`.
+
+Le seuil est **relatif au rythme du capteur** : quatre fois son intervalle de
+relevé habituel, avec une heure pour plancher. Un seuil fixe se tromperait dans
+les deux sens — le SNZB-02LD d'un frigo émet toutes les 30 min et franchirait une
+heure pour deux battements manqués, là où un capteur bavard peut se taire vingt
+minutes sans que ce soit normal.
+
+**Pas de scikit-learn.** L'implémentation de référence tirerait scipy avec elle :
+~110 Mo d'image Docker et ~90 Mo de RSS pour une seule boîte d'interface, sur une
+cible à 1 Go de RAM. L'algorithme tient en une centaine de lignes de numpy —
+déjà une dépendance du moteur de confort. Les hyperparamètres sont ceux de
+scikit-learn (100 arbres, sous-échantillon ψ = 256), et le coût ne dépend **ni du
+nombre de capteurs ni de la profondeur d'historique**, seulement de ces deux
+nombres.
+
+### Ce qu'affiche le panneau
+
+Le score brut du papier vaut ~0,5 pour un point de longueur de chemin moyenne et
+tend vers 1 pour un point isolé en peu de coupes ; l'interface en montre une
+remise à l'échelle affine dans `[0, 1]`, calibrée sur la bande observée en
+exploitation (cf. `RAW_TYPICAL` / `RAW_ISOLATED`). Les statuts :
+
+| Statut | Sens |
+|---|---|
+| `NORMAL` | score ≤ 0,3 |
+| `ATTENTION` | 0,3 < score ≤ 0,5 |
+| `ANOMALIE` | score > 0,5 |
+| `SILENCIEUX` | aucun relevé depuis 4× son intervalle habituel, une heure au moins (règle, hors forêt) |
+| `APPRENTISSAGE` | moins de 12 h d'historique exploitable — pas encore jugeable |
+
+Survolez une ligne : l'infobulle donne le score brut et la taille du jeu
+d'entraînement, ou la raison du statut.
+
+L'entraînement dure quelques centaines de millisecondes (plusieurs secondes sur
+RPi 3) alors que la page Système se rafraîchit toutes les 8 s. `get_scores()`
+sert donc **toujours le dernier résultat connu** et déclenche le recalcul dans un
+thread de fond, avec un TTL de 10 min : aucun callback Dash n'attend jamais la
+forêt, ce qui laisse `update_system` à ses 2,6 ms.
 
 ## Performance sur petit matériel
 
@@ -357,9 +451,10 @@ Les autres optimisations en place, par ordre d'importance :
   forkaient un sous-processus à chaque tick ;
 - **`psutil.cpu_percent(interval=None)`** — la variante bloquante gaspillait
   200 ms par tick ;
-- **imports paresseux** de numpy, pandas et onnxruntime (~65 Mo de RSS) dans
-  `comfort_engine` : ils ne sont chargés qu'au premier clic sur CALCULER, ce qui
-  compte sur une machine à 1 Go ;
+- **imports paresseux** de numpy, pandas et onnxruntime (~65 Mo de RSS) via
+  `modules/lazy.py` : ils ne sont chargés qu'au premier clic sur CALCULER ou au
+  premier entraînement de la forêt d'anomalies, ce qui compte sur une machine à
+  1 Go ;
 - **graphiques 24 h rafraîchis toutes les 60 s** et non toutes les 5 s : un
   historique d'une journée ne change pas visiblement en 5 secondes.
 
@@ -379,9 +474,16 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-140 tests couvrent le moteur de confort, l'état de la base, les minuteurs, le
-thème et les moteurs de chat. Ils s'exécutent en environ une seconde et
-n'utilisent ni réseau ni base de production (`tmp_path` de pytest).
+175 tests couvrent le moteur de confort, la détection d'anomalies, l'état de la
+base, les minuteurs, le thème et les moteurs de chat. Ils s'exécutent en une
+poignée de secondes et n'utilisent ni réseau ni base de production (`tmp_path` de
+pytest).
+
+Ceux d'`anomaly_engine` vérifient d'abord les propriétés de l'algorithme lui-même
+(un point isolé score au-dessus de tous les autres, un point typique autour de
+0,5, une variable constante ne casse pas la construction), puis les verdicts sur
+des séries synthétiques calibrées sur du relevé Zigbee réel — cycle jour/nuit et
+bruit de 0,15 °C — où l'on sait ce que le modèle doit trouver.
 
 Ils tournent aussi en intégration continue : le workflow
 [`.github/workflows/docker.yml`](.github/workflows/docker.yml) refuse de publier
@@ -391,8 +493,15 @@ une image dont les tests échouent.
 
 À savoir avant de se fier à l'affichage :
 
-- **Les scores d'anomalie « Isolation Forest » de la page Système sont simulés**
-  — des valeurs aléatoires. C'est une maquette d'interface, pas une mesure.
+- La détection d'anomalies est **non supervisée et sans vérité terrain** : elle
+  signale ce qui est inhabituel *pour cette installation*, pas ce qui est
+  défectueux. Un capteur détérioré de façon lente et régulière finit par définir
+  sa propre normalité et cesse d'être signalé.
+- Un capteur a besoin de **12 h d'historique exploitable** — pas forcément
+  continues — avant d'être noté, et reste sinon en `APPRENTISSAGE`. Ne comptent
+  que les pas de grille dont le relevé n'avait pas dépassé le seuil de silence
+  du capteur : sur une base fraîche ou une collecte interrompue, la boîte ML est
+  donc peu bavarde, ce qui est voulu.
 - Le moteur de confort suppose volets et fenêtres **fermés** en état initial :
   les actionneurs ne sont pas encore intégrés, il propose un plan sans savoir
   lire l'état réel.
@@ -405,6 +514,5 @@ une image dont les tests échouent.
 
 ## Licence
 
-Aucune licence n'est encore déclarée. Ajoutez un fichier `LICENSE` avant de
-publier le dépôt si vous souhaitez autoriser la réutilisation — sans licence, le
-code reste par défaut sous droit d'auteur exclusif.
+Ce projet est distribué sous **Apache License 2.0** — texte intégral dans
+[`LICENSE`](LICENSE).
