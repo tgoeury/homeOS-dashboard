@@ -39,14 +39,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# --- yt-dlp : version injectée par la CI (invalide le cache à chaque release) ---
-ARG YTDLP_VERSION=latest
-RUN if [ "$YTDLP_VERSION" = "latest" ]; then \
-        pip install --no-cache-dir -U yt-dlp; \
-    else \
-        pip install --no-cache-dir "yt-dlp==${YTDLP_VERSION}"; \
-    fi
-
 # --- Code applicatif ---
 COPY . .
 
