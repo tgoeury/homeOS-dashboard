@@ -26,6 +26,11 @@ def _clean_cache():
     test à l'autre."""
     ae.reset_cache()
     yield
+    # Laisser finir un éventuel thread de calcul lancé par le test : une fois le
+    # monkeypatch défait, il lirait la vraie base.
+    deadline = time.time() + 30
+    while ae._state["running"] and time.time() < deadline:
+        time.sleep(0.01)
     ae.reset_cache()
 
 

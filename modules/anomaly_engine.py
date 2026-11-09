@@ -549,7 +549,7 @@ def compute_scores(series: list[tuple[str, str]],
 # ══════════════════════════════════════════════════════════════════════════════
 
 _lock  = threading.Lock()
-_state: dict = {"ts": 0.0, "scores": None, "running": False}
+_state: dict = {"ts": 0.0, "scores": None, "running": False, "gen": 0}
 
 
 def get_scores(series: list[tuple[str, str]]) -> dict[tuple[str, str], SensorScore] | None:
@@ -564,18 +564,23 @@ def get_scores(series: list[tuple[str, str]]) -> dict[tuple[str, str], SensorSco
         stale = (time.time() - _state["ts"]) >= REFRESH_TTL
         if stale and not _state["running"]:
             _state["running"] = True
-            threading.Thread(target=_refresh, args=(list(series),),
+            threading.Thread(target=_refresh, args=(list(series), _state["gen"]),
                              name="anomaly-engine", daemon=True).start()
         return _state["scores"]
 
 
-def _refresh(series: list[tuple[str, str]]) -> None:
+def _refresh(series: list[tuple[str, str]], gen: int) -> None:
     try:
         scores = compute_scores(series)
     except Exception as e:
         logger.error("anomaly_engine: calcul des scores échoué — %s", e, exc_info=True)
         scores = None
     with _lock:
+        # Un reset_cache() survenu pendant le calcul invalide ce résultat : il
+        # ne doit pas écraser l'état remis à zéro (ni le drapeau `running` d'un
+        # éventuel thread lancé depuis).
+        if gen != _state["gen"]:
+            return
         if scores is not None:
             _state["scores"] = scores
         # Horodaté même en cas d'échec : sans cela, une base illisible
@@ -587,4 +592,4 @@ def _refresh(series: list[tuple[str, str]]) -> None:
 def reset_cache() -> None:
     """Vide le résultat mémorisé — tests, et rechargement à chaud."""
     with _lock:
-        _state.update(ts=0.0, scores=None, running=False)
+        _state.update(ts=0.0, scores=None, running=False, gen=_state["gen"] + 1)
