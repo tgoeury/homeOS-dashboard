@@ -13,9 +13,8 @@ httpx>=0.27          # Client HTTP async (chatbot LangGraph API)
 psutil>=5.9        # métriques système (CPU, RAM, disque, température) — machine hôte de ce dashboard
 
 plexapi
-python-vlc
 
-yt-dlp>=2024.1     # Téléchargement audio (Data dump)
+python-vlc
 mutagen>=1.47      # Lecture/écriture tags ID3 et Vorbis
 
 # Moteur de confort — inférence thermique + planification volets/fenêtres
