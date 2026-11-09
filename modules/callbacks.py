@@ -23,6 +23,7 @@ intégrations directes propres à cette application.
 
 import io
 import logging
+import math
 import time
 import random
 import zipfile
@@ -797,18 +798,35 @@ for _lroom_id, _, _, _lsensors in ROOMS:
 _landing_outputs = [Output(f"home-landing-{pos}", "children") for pos in sorted(_landing_map)]
 
 def _steadman(T: float, H: float) -> float:
-    """Température ressentie (Steadman/Rothfusz simplifié). T en °C, H en % directement."""
-    return (
-        -8.78469475556
-        + 1.61139411      * T
-        + 2.33854883889   * H
-        - 0.14611605      * T * H
-        - 0.012308094     * T ** 2
-        - 0.0164248277778 * H ** 2
-        + 0.002211732     * T ** 2 * H
-        + 0.00072546      * T * H ** 2
-        - 0.000003582     * T ** 2 * H ** 2
-    )
+    """Température ressentie sans vent (indice de chaleur, algorithme NWS complet).
+
+    T en °C, H en %. La régression de Rothfusz n'est valable que vers T ≥ 27 °C
+    (80 °F) : appliquée hors domaine elle diverge (10.6 °C / 82 % donnait 30.6 °C).
+    On suit donc la procédure NWS : formule simple de Steadman d'abord, Rothfusz
+    + ajustements uniquement si la moyenne (formule simple, T) atteint 80 °F.
+    Jamais inférieur à T (pas de refroidissement éolien sans vent).
+    """
+    tf = T * 9 / 5 + 32
+    hi = 0.5 * (tf + 61.0 + (tf - 68.0) * 1.2 + H * 0.094)
+    if (hi + tf) / 2 >= 80.0:
+        hi = (
+            -42.379
+            + 2.04901523   * tf
+            + 10.14333127  * H
+            - 0.22475541   * tf * H
+            - 0.00683783   * tf ** 2
+            - 0.05481717   * H ** 2
+            + 0.00122874   * tf ** 2 * H
+            + 0.00085282   * tf * H ** 2
+            - 0.00000199   * tf ** 2 * H ** 2
+        )
+        if H < 13 and 80 <= tf <= 112:
+            hi -= ((13 - H) / 4) * math.sqrt((17 - abs(tf - 95)) / 17)
+        elif H > 85 and 80 <= tf <= 87:
+            hi += ((H - 85) / 10) * ((87 - tf) / 5)
+    # L'indice de chaleur ne décrit que l'inconfort lié au chaud : par temps frais
+    # la formule simple passe sous T, ce qui n'a pas de sens physique sans vent.
+    return max(T, (hi - 32) * 5 / 9)
 
 
 def _trend(pts: list[tuple], current: float, threshold: float = 0.5) -> tuple[str, str]:
